@@ -19,9 +19,6 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import io.zeebe.exporter.api.Exporter;
 import io.zeebe.exporter.api.context.Context;
 import io.zeebe.exporter.api.context.Controller;
-import io.zeebe.exporters.kafka.batch.BatchedRecord;
-import io.zeebe.exporters.kafka.batch.BatchedRecordException;
-import io.zeebe.exporters.kafka.batch.RecordBatch;
 import io.zeebe.exporters.kafka.config.Config;
 import io.zeebe.exporters.kafka.config.parser.ConfigParser;
 import io.zeebe.exporters.kafka.config.parser.RawConfigParser;
@@ -29,20 +26,19 @@ import io.zeebe.exporters.kafka.config.raw.RawConfig;
 import io.zeebe.exporters.kafka.producer.DefaultKafkaProducerFactory;
 import io.zeebe.exporters.kafka.producer.KafkaProducerFactory;
 import io.zeebe.exporters.kafka.record.KafkaRecordFilter;
+import io.zeebe.exporters.kafka.record.RecordBatch;
 import io.zeebe.exporters.kafka.record.RecordHandler;
 import io.zeebe.exporters.kafka.serde.RecordId;
 import io.zeebe.exporters.kafka.serde.RecordSerializer;
 import io.zeebe.protocol.record.Record;
 import java.time.Duration;
 import java.util.Objects;
-import java.util.concurrent.CancellationException;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeoutException;
+import java.util.UUID;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerRecord;
-import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.errors.InterruptException;
+import org.apache.kafka.common.errors.TimeoutException;
 import org.apache.kafka.common.serialization.Serializer;
 import org.slf4j.Logger;
 
@@ -53,6 +49,7 @@ public class KafkaExporter implements Exporter {
 
   private final KafkaProducerFactory producerFactory;
   private final ConfigParser<RawConfig, Config> configParser;
+  private final String producerId;
 
   private boolean isClosed = true;
   private String id;
@@ -62,7 +59,6 @@ public class KafkaExporter implements Exporter {
   private Config config;
   private RecordHandler recordHandler;
   private RecordBatch recordBatch;
-  private long latestExportedPosition = UNSET_POSITION;
 
   public KafkaExporter() {
     this(new DefaultKafkaProducerFactory(), new RawConfigParser());
@@ -71,8 +67,16 @@ public class KafkaExporter implements Exporter {
   public KafkaExporter(
       final @NonNull KafkaProducerFactory producerFactory,
       final @NonNull ConfigParser<RawConfig, Config> configParser) {
+    this(producerFactory, configParser, UUID.randomUUID().toString());
+  }
+
+  public KafkaExporter(
+      final @NonNull KafkaProducerFactory producerFactory,
+      final @NonNull ConfigParser<RawConfig, Config> configParser,
+      final @NonNull String producerId) {
     this.producerFactory = Objects.requireNonNull(producerFactory);
     this.configParser = Objects.requireNonNull(configParser);
+    this.producerId = producerId;
   }
 
   @Override
@@ -92,10 +96,9 @@ public class KafkaExporter implements Exporter {
   public void open(final Controller controller) {
     this.controller = controller;
     this.isClosed = false;
-    this.producer = this.producerFactory.newProducer(this.config);
     this.recordBatch = new RecordBatch(this.config.getMaxBatchSize());
     this.controller.scheduleTask(
-        this.config.getInFlightRecordCheckInterval(), this::checkCompletedInFlightRequests);
+        this.config.getInFlightRecordCheckInterval(), this::periodicallyUpdateAcknowledgedPosition);
 
     this.logger.debug("Opened exporter {}", this.id);
   }
@@ -107,8 +110,7 @@ public class KafkaExporter implements Exporter {
     }
 
     isClosed = true;
-    recordBatch.cancel();
-    checkCompletedInFlightRequests();
+    updateAcknowledgedPosition();
     recordBatch.clear();
     closeProducer();
 
@@ -127,35 +129,84 @@ public class KafkaExporter implements Exporter {
       return;
     }
 
-    if (recordBatch.isFull()) {
-      // this will await completion of the record and update the position, OR an exception may be
-      // thrown which will cause us to retry - either way, if we pass this then we can assume
-      // there's space in the batch now
-      logger.trace(
-          "Too many in flight records, blocking at most {} until at least one completes...",
-          Duration.ofSeconds(1));
-      recordBatch.consume(this::updatePosition);
+    try {
+      batchRecord(record);
+    } catch (final TimeoutException e) {
+      logger.debug("Timed out while exporting record, retrying", e);
+    } catch (final InterruptException e) {
+      Thread.currentThread().interrupt();
+      logger.debug("Interrupted while exporting record, retrying", e);
+    } catch (final KafkaException | IllegalStateException e) {
+      logger.warn(
+          "Non-recoverable error occurred while exporting record, retrying with new producer", e);
+      closeProducer();
+    }
+  }
+
+  @SuppressWarnings("rawtypes")
+  private void batchRecord(final Record record) {
+    if (producer == null) {
+      initializeProducer();
     }
 
-    batchRecord(record);
+    if (recordBatch.isFull()) {
+      logger.trace(
+          "Too many in flight records, blocking at most {} until transaction completes...",
+          Duration.ofSeconds(1));
+      updateAcknowledgedPosition();
+    }
+
+    final ProducerRecord<RecordId, byte[]> producerRecord = recordHandler.transform(record);
+    if (recordBatch.isEmpty()) {
+      producer.beginTransaction();
+    }
+
+    recordBatch.add(producerRecord);
+    producer.send(producerRecord);
     logger.trace("Batched record {}", record);
   }
 
   /* assumes it is called strictly as a scheduled task or during close */
-  private void checkCompletedInFlightRequests() {
-    try {
-      recordBatch.consumeCompleted(this::updatePosition);
-    } catch (final BatchedRecordException e) {
-      handleBatchedRecordException(e);
-    }
-
-    if (latestExportedPosition != UNSET_POSITION) {
-      controller.updateLastExportedRecordPosition(latestExportedPosition);
-    }
+  private void periodicallyUpdateAcknowledgedPosition() {
+    updateAcknowledgedPosition();
 
     if (!isClosed) {
       controller.scheduleTask(
-          IN_FLIGHT_RECORD_CHECKER_INTERVAL, this::checkCompletedInFlightRequests);
+          IN_FLIGHT_RECORD_CHECKER_INTERVAL, this::periodicallyUpdateAcknowledgedPosition);
+    }
+  }
+
+  private void updateAcknowledgedPosition() {
+    if (producer == null) {
+      initializeProducer();
+    }
+
+    // nothing to commit in this case
+    if (recordBatch.isEmpty()) {
+      return;
+    }
+
+    try {
+      commitBatch();
+    } catch (final TimeoutException e) {
+      logger.debug("Timed out while committing, retrying", e);
+    } catch (final InterruptException e) {
+      Thread.currentThread().interrupt();
+      logger.debug("Interrupted while committing, retrying", e);
+    } catch (final KafkaException | IllegalStateException e) {
+      logger.warn("Non-recoverable error occurred while committing, retrying with new producer", e);
+      closeProducer();
+    }
+  }
+
+  private void commitBatch() {
+    final long highestAcknowledgedPosition = recordBatch.getHighestPosition();
+    producer.commitTransaction();
+    recordBatch.clear();
+
+    if (highestAcknowledgedPosition != UNSET_POSITION) {
+      controller.updateLastExportedRecordPosition(highestAcknowledgedPosition);
+      logger.trace("Updated last exported record position to {}", highestAcknowledgedPosition);
     }
   }
 
@@ -167,80 +218,32 @@ public class KafkaExporter implements Exporter {
     return serializer;
   }
 
-  @SuppressWarnings("rawtypes")
-  private void batchRecord(final Record record) {
-    final ProducerRecord<RecordId, byte[]> producerRecord = recordHandler.transform(record);
-    final Future<RecordMetadata> request = producer.send(producerRecord);
+  private void initializeProducer() {
+    logger.debug("Initializing new producer with {} records to retry", recordBatch.recordsCount());
+    producer = producerFactory.newProducer(config, producerId);
+    producer.initTransactions();
 
-    recordBatch.add(producerRecord, request);
+    if (!recordBatch.isEmpty()) {
+      retryBatch();
+    }
   }
 
-  private void updatePosition(final BatchedRecord record) {
-    try {
-      // note that normally this will not block as we usually only check completed records
-      // however, it's a good way to handle the case where we do want to block (i.e. if the batch
-      // is full) while also handling errors or cancellation
-      record.awaitCompletion(config.getMaxBlockingTimeout());
-      latestExportedPosition = record.getRecord().key().getPosition();
-    } catch (final ExecutionException e) {
-      // rethrow and let this be handled where we're expecting it; by doing this we can also ensure
-      // the record is not removed from the batch yet
-      throw new BatchedRecordException(record, e);
-    } catch (final CancellationException e) {
-      // if this occurs while we're waiting for the result, then we can safely expect that it was
-      // cancelled in the context of this exporter, so there's nothing to do here
-      logger.trace("Record {} was cancelled while awaiting result", record, e);
-    } catch (final InterruptedException e) { // NOSONAR - InterruptException will re-interrupt
-      // being interrupted while awaiting completion of the request most likely means the exporter
-      // thread is shutting down, at which point we can expect to be closed; so simply rethrow this
-      // exception
-      throw new InterruptException(e);
-    } catch (final TimeoutException e) {
-      throw new BlockingRequestTimeoutException(record, config.getMaxBlockingTimeout(), e);
+  private void retryBatch() {
+    producer.beginTransaction();
+
+    for (final var record : recordBatch) {
+      producer.send(record);
     }
   }
 
   private void closeProducer() {
-    if (producer != null) {
-      final Duration closeTimeout = config.getProducer().getCloseTimeout();
-      logger.debug("Closing producer with timeout {}", closeTimeout);
-      producer.close(closeTimeout);
-      producer = null;
-    }
-  }
-
-  /**
-   * A {@link BatchedRecordException} is thrown when attempting to check the result of a record that
-   * was sent by the producer via {@link Producer#send(ProducerRecord)}, and an error occurred.
-   *
-   * <p>There are two possible classes of errors: recoverable and unrecoverable ones. These are
-   * outlined in {@link org.apache.kafka.clients.producer.Callback}. In both cases, we have to
-   * cancel all in flight records, as we don't know how the producer batched internally - to
-   * preserve logical ordering, we then cancel all records, and retry them.
-   *
-   * <p>Additionally, in the case of an unrecoverable error, we recreate the producer, which may
-   * help solve some issues. However, some errors are plain and simply non recoverable - an
-   * authentication error will not be solved without a configuration change.
-   *
-   * @param e the exception thrown
-   */
-  private void handleBatchedRecordException(final BatchedRecordException e) {
-    logger.trace(
-        "Cancelling all in flight records after {} and retrying them due to an exception thrown by the underlying producer",
-        e.getRecord(),
-        e);
-
-    if (!e.isRecoverable()) {
-      logger.warn("Recreating producer due to an unrecoverable exception", e);
-      closeProducer();
-      producer = producerFactory.newProducer(config);
+    if (producer == null) {
+      return;
     }
 
-    for (final BatchedRecord batchedRecord : recordBatch) {
-      batchedRecord.cancel();
-
-      final Future<RecordMetadata> request = producer.send(batchedRecord.getRecord());
-      batchedRecord.retry(request);
-    }
+    final Duration closeTimeout = config.getProducer().getCloseTimeout();
+    logger.debug("Closing producer with timeout {}", closeTimeout);
+    producer.close(closeTimeout);
+    producer = null;
   }
 }

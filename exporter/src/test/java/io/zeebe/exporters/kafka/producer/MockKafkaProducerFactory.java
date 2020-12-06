@@ -32,6 +32,7 @@ import org.apache.kafka.clients.producer.Producer;
 public class MockKafkaProducerFactory implements KafkaProducerFactory {
   public Supplier<MockProducer<RecordId, byte[]>> mockProducerSupplier;
   public MockProducer<RecordId, byte[]> mockProducer;
+  public String producerId;
 
   public MockKafkaProducerFactory(
       final @NonNull Supplier<MockProducer<RecordId, byte[]>> mockProducerSupplier) {
@@ -39,7 +40,9 @@ public class MockKafkaProducerFactory implements KafkaProducerFactory {
   }
 
   @Override
-  public @NonNull Producer<RecordId, byte[]> newProducer(final @NonNull Config config) {
+  public @NonNull Producer<RecordId, byte[]> newProducer(
+      final @NonNull Config config, final @NonNull String producerId) {
+    this.producerId = producerId;
     if (mockProducer == null || mockProducer.closed()) {
       mockProducer = mockProducerSupplier.get();
     }

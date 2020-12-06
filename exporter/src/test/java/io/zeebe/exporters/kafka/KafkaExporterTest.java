@@ -31,19 +31,8 @@ import io.zeebe.protocol.record.Record;
 import io.zeebe.test.exporter.ExporterTestHarness;
 import java.util.List;
 import java.util.stream.IntStream;
-import org.apache.kafka.clients.consumer.internals.NoAvailableBrokersException;
 import org.apache.kafka.clients.producer.MockProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
-import org.apache.kafka.common.errors.CorruptRecordException;
-import org.apache.kafka.common.errors.InvalidTopicException;
-import org.apache.kafka.common.errors.NotEnoughReplicasAfterAppendException;
-import org.apache.kafka.common.errors.NotEnoughReplicasException;
-import org.apache.kafka.common.errors.OffsetMetadataTooLarge;
-import org.apache.kafka.common.errors.RecordBatchTooLargeException;
-import org.apache.kafka.common.errors.RecordTooLargeException;
-import org.apache.kafka.common.errors.TimeoutException;
-import org.apache.kafka.common.errors.UnknownServerException;
-import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.junit.Before;
 import org.junit.Test;
@@ -83,6 +72,7 @@ public class KafkaExporterTest {
     // then
     final ProducerRecord<RecordId, byte[]> expected =
         new RecordHandler(mockConfigParser.config.getRecords()).transform(record);
+    mockProducerFactory.mockProducer.commitTransaction();
     assertThat(mockProducerFactory.mockProducer.history()).hasSize(1);
 
     final ProducerRecord<RecordId, byte[]> producedRecord =
@@ -90,31 +80,6 @@ public class KafkaExporterTest {
     assertThat(producedRecord.topic()).isEqualTo(expected.topic());
     assertThat(producedRecord.key()).isEqualTo(expected.key());
     assertThat(producedRecord.value()).isEqualTo(expected.value());
-  }
-
-  @Test
-  public void shouldUpdatePositionBasedOnCompletedRequests() throws Exception {
-    // given
-    final int recordsCount = 4;
-
-    // control how many are completed
-    mockProducerFactory.mockProducer =
-        new MockProducer<>(false, new RecordIdSerializer(), new ByteArraySerializer());
-    rawConfig.maxBatchSize = Integer.MAX_VALUE; // prevent blocking awaiting completion
-    mockConfigParser.forceParse(rawConfig);
-
-    testHarness.configure(EXPORTER_ID, rawConfig);
-    testHarness.open();
-
-    // when
-    final List<Record> records = testHarness.stream().export(recordsCount);
-    final int lastCompleted = records.size() - 2;
-    completeNextRequests(lastCompleted);
-    checkInFlightRequests();
-
-    // then
-    assertThat(testHarness.getLastUpdatedPosition())
-        .isEqualTo(records.get(lastCompleted).getPosition());
   }
 
   @Test
@@ -137,9 +102,8 @@ public class KafkaExporterTest {
     final Record exported = testHarness.export();
     mockProducerFactory.mockProducer.completeNext();
     final Record notExported = testHarness.export();
-    checkInFlightRequests();
 
-    // then
+    // then - no need to check the position is updated since when full it will have done so already
     assertThat(testHarness.getLastUpdatedPosition())
         .isEqualTo(exported.getPosition())
         .isNotEqualTo(notExported.getPosition());
@@ -191,121 +155,15 @@ public class KafkaExporterTest {
 
     // when
     testHarness.export();
-    mockProducerFactory.mockProducer.errorNext(new RuntimeException("failed"));
+    mockProducerFactory.mockProducer.fenceProducer();
     checkInFlightRequests();
     testHarness.stream().export(2);
+    mockProducerFactory.mockProducer.commitTransaction();
 
     // then
     assertThat(mockProducerFactory.mockProducer.history())
         .describedAs("should have the produced the exact amount of exported records")
         .hasSize(3);
-  }
-
-  @Test
-  public void shouldRetryOnRecoverableError() throws Exception {
-    // given
-    // this is an non exhaustive list of recoverable exceptions - see all children of
-    // org.apache.kafka.common.errors.RetriableExceptions applicable to a producer
-    final List<RuntimeException> exceptions =
-        List.of(
-            new CorruptRecordException(),
-            new NoAvailableBrokersException(),
-            new NotEnoughReplicasAfterAppendException("error"),
-            new NotEnoughReplicasException(),
-            new TimeoutException(),
-            new UnknownTopicOrPartitionException());
-    // disable auto completion for better control of the retry mechanism
-    mockProducerFactory.mockProducerSupplier =
-        () -> new MockProducer<>(false, new RecordIdSerializer(), new ByteArraySerializer());
-    testHarness.configure(EXPORTER_ID, rawConfig);
-    testHarness.open();
-
-    // when
-    final List<Record> records = testHarness.stream().export(exceptions.size());
-    for (int i = 0; i < exceptions.size(); i++) {
-      final var previousMockProducer = mockProducerFactory.mockProducer;
-      final var producedRecordCount = previousMockProducer.history().size();
-      mockProducerFactory.mockProducer.errorNext(exceptions.get(i));
-      checkInFlightRequests();
-
-      // unfortunately cancel does nothing, so simulate it by "ignoring" the next few records so we
-      // start over; note that the exporter stopped monitoring these calls so they won't impact the
-      // rest of the test
-      for (int j = 0; j < (exceptions.size() - i) - 1; j++) {
-        mockProducerFactory.mockProducer.errorNext(new RuntimeException("cancelled"));
-      }
-      mockProducerFactory.mockProducer.completeNext();
-      checkInFlightRequests();
-
-      assertThat(mockProducerFactory.mockProducer.history())
-          .as("should have retried all remaining records")
-          .hasSize(producedRecordCount + records.size() - i);
-      assertThat(testHarness.getLastUpdatedPosition())
-          .as("should update position on retry")
-          .isEqualTo(records.get(i).getPosition());
-      assertThat(mockProducerFactory.mockProducer)
-          .as("should not have closed producer on recoverable error")
-          .isSameAs(previousMockProducer);
-    }
-
-    // check that we can export more successfully
-    records.add(testHarness.export());
-    mockProducerFactory.mockProducer.completeNext();
-    checkInFlightRequests();
-
-    // then
-    assertThat(testHarness.getLastUpdatedPosition())
-        .as("should have acknowledged the last record position")
-        .isEqualTo(records.get(records.size() - 1).getPosition());
-  }
-
-  @Test
-  public void shouldRetryUnrecoverableErrors() throws Exception {
-    // given
-    final List<RuntimeException> exceptions =
-        List.of(
-            new InvalidTopicException(),
-            new OffsetMetadataTooLarge(),
-            new RecordBatchTooLargeException(),
-            new RecordTooLargeException(),
-            new UnknownServerException());
-    // disable auto completion for better control of the retry mechanism
-    mockProducerFactory.mockProducerSupplier =
-        () -> new MockProducer<>(false, new RecordIdSerializer(), new ByteArraySerializer());
-    testHarness.configure(EXPORTER_ID, rawConfig);
-    testHarness.open();
-
-    // when
-    final List<Record> records = testHarness.stream().export(exceptions.size() + 2);
-    for (int i = 0; i < exceptions.size(); i++) {
-      final var previousMockProducer = mockProducerFactory.mockProducer;
-      mockProducerFactory.mockProducer.errorNext(exceptions.get(i));
-      checkInFlightRequests();
-      mockProducerFactory.mockProducer.completeNext();
-      checkInFlightRequests();
-
-      assertThat(mockProducerFactory.mockProducer.history())
-          .as("should have retried all records to the producer")
-          .hasSize(records.size() - i);
-      assertThat(testHarness.getLastUpdatedPosition())
-          .as("should update position on retry")
-          .isEqualTo(records.get(i).getPosition());
-      assertThat(mockProducerFactory.mockProducer)
-          .as("should close producer on unrecoverable error")
-          .isNotSameAs(previousMockProducer);
-    }
-
-    // complete the rest of the calls
-    mockProducerFactory
-        .mockProducer
-        .history()
-        .forEach(ignored -> mockProducerFactory.mockProducer.completeNext());
-    checkInFlightRequests();
-
-    // then
-    assertThat(testHarness.getLastUpdatedPosition())
-        .as("should have acknowledged the last record position")
-        .isEqualTo(records.get(records.size() - 1).getPosition());
   }
 
   @NonNull

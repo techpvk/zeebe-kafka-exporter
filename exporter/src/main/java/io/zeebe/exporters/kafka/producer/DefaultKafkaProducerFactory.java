@@ -42,19 +42,22 @@ import org.apache.kafka.common.serialization.ByteArraySerializer;
  */
 public final class DefaultKafkaProducerFactory implements KafkaProducerFactory {
   @Override
-  public @NonNull Producer<RecordId, byte[]> newProducer(final @NonNull Config config) {
+  public @NonNull Producer<RecordId, byte[]> newProducer(
+      final @NonNull Config config, final String producerId) {
     final Map<String, Object> options = new HashMap<>();
+    final String clientId = String.format("%s-%s", config.getProducer().getClientId(), producerId);
 
+    options.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, producerId);
+    options.put(ProducerConfig.CLIENT_ID_CONFIG, clientId);
     options.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
-    // since we're using "infinite" retries/delivery with an idempotent producer, setting the max
-    // in flight requests to 1 ensures batches are delivered in order.
+
+    // disable concurrent connections to ensure order is preserved
     options.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 1);
     options.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, Integer.MAX_VALUE);
     options.put(
         ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG,
         (int) config.getProducer().getRequestTimeout().toMillis());
     options.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, config.getProducer().getServers());
-    options.put(ProducerConfig.CLIENT_ID_CONFIG, config.getProducer().getClientId());
 
     // provides a soft memory bound - there's some memory overhead used by SSL, compression, etc.,
     // but this gives us a good idea of how much memory will be used by the exporter

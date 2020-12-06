@@ -13,20 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.zeebe.exporters.kafka.batch;
+package io.zeebe.exporters.kafka.record;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import io.zeebe.exporters.kafka.serde.RecordId;
 import java.nio.charset.StandardCharsets;
 import java.util.Iterator;
 import java.util.LinkedList;
-import java.util.Objects;
-import java.util.concurrent.Future;
-import java.util.function.Consumer;
 import org.apache.kafka.clients.producer.ProducerRecord;
-import org.apache.kafka.clients.producer.RecordMetadata;
 
-public final class RecordBatch implements Iterable<BatchedRecord> {
+public final class RecordBatch implements Iterable<ProducerRecord<RecordId, byte[]>> {
 
   /**
    * Attempts to estimate the size of a {@link RecordId} in bytes. This was obtained by serializing
@@ -35,10 +31,11 @@ public final class RecordBatch implements Iterable<BatchedRecord> {
    */
   private static final int ESTIMATED_SERIALIZED_RECORD_ID_SIZE_IN_BYTES = 57;
 
-  private final LinkedList<BatchedRecord> records;
+  private final LinkedList<ProducerRecord<RecordId, byte[]>> records;
   private final long maxSizeInBytes;
 
   private long sizeInBytes;
+  private long highestPosition;
 
   public RecordBatch(final long maxSizeInBytes) {
     this.maxSizeInBytes = maxSizeInBytes;
@@ -47,11 +44,9 @@ public final class RecordBatch implements Iterable<BatchedRecord> {
     this.sizeInBytes = 0L;
   }
 
-  public void add(
-      final @NonNull ProducerRecord<RecordId, byte[]> record,
-      final @NonNull Future<RecordMetadata> request) {
-    final BatchedRecord batchedRecord = new BatchedRecord(record, request);
-    records.add(batchedRecord);
+  public void add(final @NonNull ProducerRecord<RecordId, byte[]> record) {
+    records.add(record);
+    highestPosition = Math.max(highestPosition, record.key().getPosition());
     sizeInBytes += estimateSerializedRecordSize(record);
   }
 
@@ -62,36 +57,23 @@ public final class RecordBatch implements Iterable<BatchedRecord> {
   public void clear() {
     records.clear();
     sizeInBytes = 0;
+    highestPosition = -1;
   }
 
-  public void cancel() {
-    records.forEach(BatchedRecord::cancel);
+  public boolean isEmpty() {
+    return records.isEmpty();
   }
 
-  public void consume(final @NonNull Consumer<BatchedRecord> consumer) {
-    Objects.requireNonNull(consumer);
-
-    final BatchedRecord batchedRecord = records.peek();
-    if (batchedRecord != null) {
-      consumer.accept(batchedRecord);
-      records.remove();
-    }
+  public long getHighestPosition() {
+    return highestPosition;
   }
 
-  public void consumeCompleted(final @NonNull Consumer<BatchedRecord> consumer) {
-    Objects.requireNonNull(consumer);
-    BatchedRecord batchedRecord = records.peek();
-
-    while (batchedRecord != null && batchedRecord.wasExported()) {
-      consumer.accept(batchedRecord);
-      records.remove();
-      batchedRecord = records.peek();
-    }
+  public int recordsCount() {
+    return records.size();
   }
 
-  @NonNull
   @Override
-  public Iterator<BatchedRecord> iterator() {
+  public Iterator<ProducerRecord<RecordId, byte[]>> iterator() {
     return records.iterator();
   }
 

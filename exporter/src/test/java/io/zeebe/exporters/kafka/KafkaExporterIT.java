@@ -59,7 +59,9 @@ public class KafkaExporterIT {
 
   @Rule
   public KafkaContainer kafkaContainer =
-      new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:5.5.1"))
+      new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka").withTag("5.4.3"))
+          .withEnv("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+          .withEnv("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
           .withEmbeddedZookeeper();
 
   private RawConfig exporterConfiguration;

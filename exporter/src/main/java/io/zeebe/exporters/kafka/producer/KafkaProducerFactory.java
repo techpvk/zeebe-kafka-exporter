@@ -27,5 +27,5 @@ import org.apache.kafka.clients.producer.Producer;
 @FunctionalInterface
 public interface KafkaProducerFactory {
   @NonNull
-  Producer<RecordId, byte[]> newProducer(@NonNull Config config);
+  Producer<RecordId, byte[]> newProducer(final @NonNull Config config, final String producerId);
 }
