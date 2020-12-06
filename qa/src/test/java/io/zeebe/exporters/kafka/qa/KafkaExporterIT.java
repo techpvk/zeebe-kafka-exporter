@@ -193,9 +193,10 @@ final class KafkaExporterIT {
 
   @SuppressWarnings("OctalInteger")
   private ZeebeContainer newZeebeContainer() {
-    final ZeebeContainer container =
-        new ZeebeContainer(
-            "camunda/zeebe:" + ZeebeClient.class.getPackage().getImplementationVersion());
+    final DockerImageName zeebeImageName =
+        DockerImageName.parse("camunda/zeebe")
+            .withTag(ZeebeClient.class.getPackage().getImplementationVersion());
+    final ZeebeContainer container = new ZeebeContainer(zeebeImageName.asCanonicalNameString());
     final MountableFile exporterJar =
         MountableFile.forClasspathResource("zeebe-kafka-exporter.jar", 0775);
     final MountableFile exporterConfig = MountableFile.forClasspathResource("exporters.yml", 0775);
@@ -217,9 +218,9 @@ final class KafkaExporterIT {
   }
 
   private ElasticsearchContainer newElasticContainer() {
-    final ElasticsearchContainer container =
-        new ElasticsearchContainer(
-            DockerImageName.parse("docker.elastic.co/elasticsearch/elasticsearch:6.8.13"));
+    final DockerImageName elasticImageName =
+        DockerImageName.parse("docker.elastic.co/elasticsearch/elasticsearch").withTag("6.8.13");
+    final ElasticsearchContainer container = new ElasticsearchContainer(elasticImageName);
     final Slf4jLogConsumer logConsumer =
         new Slf4jLogConsumer(newContainerLogger("elasticContainer"), true);
 
@@ -230,12 +231,15 @@ final class KafkaExporterIT {
   }
 
   private KafkaContainer newKafkaContainer() {
-    final KafkaContainer container =
-        new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:5.5.1"));
+    final DockerImageName kafkaImage =
+        DockerImageName.parse("confluentinc/cp-kafka").withTag("5.5.1");
+    final KafkaContainer container = new KafkaContainer(kafkaImage);
     final Slf4jLogConsumer logConsumer =
         new Slf4jLogConsumer(newContainerLogger("kafkaContainer"), true);
 
     return container
+        .withEnv("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+        .withEnv("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
         .withEmbeddedZookeeper()
         .withNetwork(network)
         .withNetworkAliases("kafka")
